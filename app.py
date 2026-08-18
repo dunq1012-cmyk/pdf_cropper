@@ -1,11 +1,7 @@
-import io
-import fitz  # PyMuPDF
 import streamlit as st
 from PIL import Image
 from streamlit_cropper import st_cropper
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-import reportlab.lib.utils
+from core.pdf_handler import get_pdf_page_image, build_reconstructed_pdf
 
 st.set_page_config(page_title="PDF交互式切块与重组", layout="wide")
 
@@ -14,34 +10,25 @@ st.caption("上传多页 PDF ➡️ 切换页面画框裁切碎片 ➡️ 勾选
 
 # 初始化 Session State
 if "fragments" not in st.session_state:
-    st.session_state.fragments = []  # 保存所有切好的碎片 [{id, name, image, keep}]
+    st.session_state.fragments = []
 if "frag_counter" not in st.session_state:
     st.session_state.frag_counter = 1
 
-# --- 1. PDF 上传与加载 ---
+# --- 1. PDF 上传 ---
 uploaded_pdf = st.file_uploader("上传你的 PDF 报告（支持单页/多页）", type=["pdf"])
 
 if uploaded_pdf:
     pdf_bytes = uploaded_pdf.read()
 
-    # 获取 PDF 总页数并读取指定页码
-    @st.cache_data
-    def get_pdf_page_image(pdf_data, page_num):
-        doc = fitz.open(stream=pdf_data, filetype="pdf")
-        page = doc[page_num]
-        pix = page.get_pixmap(dpi=150)
-        return Image.open(io.BytesIO(pix.tobytes("png")))
-
-    doc_temp = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = len(doc_temp)
-
     col_crop, col_list = st.columns([1.1, 0.9])
 
-    # --- 2. 左侧：多页选择与交互式划框裁切区 ---
+    # --- 2. 左侧：页面选择与裁切区 ---
     with col_crop:
         st.subheader("1. 在图上移动框/划定分割区域")
 
-        # 核心改进：如果是多页 PDF，提供翻页/选页功能
+        # 预先获取第 0 页以拿到总页数
+        _, total_pages = get_pdf_page_image(pdf_bytes, 0)
+
         if total_pages > 1:
             selected_page_idx = st.selectbox(
                 f"📄 该 PDF 共 {total_pages} 页，请选择当前要裁剪的页面：",
@@ -51,8 +38,8 @@ if uploaded_pdf:
         else:
             selected_page_idx = 0
 
-        # 加载当前选中页面的图片
-        pdf_img = get_pdf_page_image(pdf_bytes, selected_page_idx)
+        # 调用核心模块获取指定页图片
+        pdf_img, _ = get_pdf_page_image(pdf_bytes, selected_page_idx)
 
         st.info("💡 移动或缩放红框选择需要的模块，然后点击下方【确认截取】。可以随时切换页面继续截取！")
 
@@ -61,7 +48,7 @@ if uploaded_pdf:
             realtime_update=True,
             box_color='#FF0000',
             aspect_ratio=None,
-            key=f"cropper_page_{selected_page_idx}"  # 切换页面时重置裁切框
+            key=f"cropper_page_{selected_page_idx}"
         )
 
         if st.button("✂️ 确认截取此模块碎片", type="primary", use_container_width=True):
@@ -80,14 +67,14 @@ if uploaded_pdf:
             st.success(f"✅ 已成功从第 {selected_page_idx+1} 页截取碎片！可在右侧管理。")
             st.rerun()
 
-    # --- 3. 右侧：碎片管理 (跨页碎片统一管理) ---
+    # --- 3. 右侧：碎片卡片管理 ---
     with col_list:
         st.subheader("2. 碎片卡片管理 & 顺序调整")
 
         if not st.session_state.fragments:
             st.warning("👈 请在左侧选择页面、移动框并点击【确认截取】生成第一个碎片。")
         else:
-            st.caption("💡 所有从不同页面截取的碎片都可以在这里混合自由上下排序：")
+            st.caption("💡 所有碎片都可以在这里混合自由上下排序：")
             for idx, item in enumerate(st.session_state.fragments):
                 with st.expander(f"📌 {item['name']}", expanded=True):
                     c_chk, c_up, c_down, c_del = st.columns([0.4, 0.2, 0.2, 0.2])
@@ -113,7 +100,7 @@ if uploaded_pdf:
 
                     st.image(item["image"], use_container_width=True)
 
-    # --- 4. 底部：合成 A4 预览与 PDF 导出 ---
+    # --- 4. 底部：导出 A4 PDF ---
     st.markdown("---")
     st.subheader("3. 最终重新排版与 PDF 预览")
 
@@ -123,43 +110,14 @@ if uploaded_pdf:
         preview_col, download_col = st.columns([2, 1])
 
         with preview_col:
-            st.caption("📄 模拟 A4 最终打印流（跨页碎片已自动整合重排）：")
+            st.caption("📄 模拟 A4 最终打印流：")
             st.markdown('<div style="border:1px solid #ccc; padding:10px; background:#fff;">', unsafe_allow_html=True)
             for f in active_frags:
                 st.image(f["image"], caption=f.get("name"), use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
         with download_col:
-            def build_pdf(frags):
-                pdf_buf = io.BytesIO()
-                c = canvas.Canvas(pdf_buf, pagesize=A4)
-                a4_w, a4_h = A4
-                y_pos = a4_h - 20
-
-                for item in frags:
-                    img = item["image"]
-                    img_buf = io.BytesIO()
-                    img.save(img_buf, format="PNG")
-                    img_buf.seek(0)
-
-                    draw_w = a4_w - 40
-                    draw_h = (img.height / img.width) * draw_w
-
-                    if y_pos - draw_h < 20:
-                        c.showPage()
-                        y_pos = a4_h - 20
-
-                    c.drawImage(
-                        reportlab.lib.utils.ImageReader(img_buf),
-                        20, y_pos - draw_h, width=draw_w, height=draw_h
-                    )
-                    y_pos -= (draw_h + 10)
-
-                c.save()
-                pdf_buf.seek(0)
-                return pdf_buf
-
-            pdf_data = build_pdf(active_frags)
+            pdf_data = build_reconstructed_pdf(active_frags)
 
             st.write("### 导出成果")
             st.download_button(
